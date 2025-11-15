@@ -1,0 +1,24 @@
+2025-11-14 20:50:19,863 - INFO - ✓ 导入文档解析器
+2025-11-14 20:50:19,865 - INFO - ✓ 导入文本处理器
+2025-11-14 20:50:19,868 - INFO - ✓ 导入题目生成器
+2025-11-14 20:50:19,936 - INFO - 数据库连接成功（使用psycopg2）
+============================================================
+VocabSlayer 自定义题库API服务器
+============================================================
+上传目录: /tmp/vocabslayer_7z0co5cd
+服务器运行在 http://0.0.0.0:5000
+============================================================
+✓ 数据库连接成功
+ * Serving Flask app 'api_server'
+ * Debug mode: off
+2025-11-14 20:50:19,944 - INFO - [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://10.129.211.118:5000
+2025-11-14 20:50:19,944 - INFO - [33mPress CTRL+C to quit[0m
+2025-11-14 20:50:24,783 - INFO - 原始文件名: test_document.txt, 安全文件名: test_document.txt
+2025-11-14 20:50:24,784 - INFO - 文件上传成功: test_document.txt, 用户ID: 1
+2025-11-14 20:50:24,784 - INFO - 文件路径: /tmp/vocabslayer_7z0co5cd/test_document.txt
+2025-11-14 20:50:24,786 - INFO - 127.0.0.1 - - [14/Nov/2025 20:50:24] "[31m[1mPOST /api/upload HTTP/1.1[0m" 400 -
+2025-11-14 20:50:24,795 - ERROR - 获取题库列表失败: 'psycopg2.extensions.connection' object has no attribute 'execute'
+2025-11-14 20:50:24,796 - INFO - 127.0.0.1 - - [14/Nov/2025 20:50:24] "[35m[1mGET /api/banks/1 HTTP/1.1[0m" 500 -

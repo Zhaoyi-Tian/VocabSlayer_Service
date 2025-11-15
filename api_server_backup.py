@@ -22,6 +22,9 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 sys.path.insert(0, os.path.join(current_dir, 'common'))
 
+# 导入进度管理器
+from progress_manager import progress_manager
+
 # 配置
 app = Flask(__name__)
 CORS(app)
@@ -33,26 +36,40 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# 全局变量
+db_connection = None
+
 # 数据库配置
 DB_CONFIG = {
     'host': 'localhost',
     'port': 5432,
     'database': 'vocabulary_db',
     'user': 'openEuler',
-    'password': 'Qq13896842746',
-    'connect_timeout': 5
+    'password': 'Qq13896842746'
 }
 
 def get_db_connection():
     """获取数据库连接"""
-    try:
-        import psycopg2
-        conn = psycopg2.connect(**DB_CONFIG)
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        logger.error(f"数据库连接失败: {e}")
-        return None
+    global db_connection
+    if db_connection is None or db_connection.closed:
+        try:
+            import psycopg2
+            db_connection = psycopg2.connect(**DB_CONFIG)
+            # 设置自动提交
+            db_connection.autocommit = True
+            logger.info("数据库连接成功（使用psycopg2）")
+        except Exception as e:
+            logger.error(f"数据库连接失败: {e}")
+            db_connection = None
+    return db_connection
+
+def sql_escape(s):
+    """转义SQL字符串"""
+    if s is None:
+        return "NULL"
+    s = str(s)
+    s = s.replace("'", "''")
+    return f"'{s}'"
 
 # 导入文档处理模块
 ParserFactory = None
@@ -77,132 +94,6 @@ try:
 except ImportError as e:
     logger.warning(f"✗ 无法导入题目生成器: {e}")
 
-"""
-进度管理器 - 管理文件处理任务的进度
-"""
-import json
-import time
-from typing import Dict, Optional
-from dataclasses import dataclass, asdict
-from queue import Queue, Empty
-import logging
-
-logger = logging.getLogger(__name__)
-
-@dataclass
-class ProgressUpdate:
-    """进度更新消息"""
-    task_id: str
-    status: str  # 'processing', 'completed', 'error'
-    progress: int  # 0-100
-    message: str
-    current_step: str
-    details: Optional[dict] = None
-    timestamp: float = None
-
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = time.time()
-
-class ProgressManager:
-    """进度管理器"""
-
-    def __init__(self):
-        self.task_queues: Dict[str, Queue] = {}
-        self.tasks: Dict[str, dict] = {}
-        self.cleanup_interval = 300  # 5分钟清理一次过期任务
-
-    def create_task(self, task_id: str, filename: str, user_id: int) -> dict:
-        """创建新任务"""
-        self.tasks[task_id] = {
-            'task_id': task_id,
-            'filename': filename,
-            'user_id': user_id,
-            'created_at': time.time(),
-            'updated_at': time.time()
-        }
-
-        # 创建任务的消息队列
-        if task_id not in self.task_queues:
-            self.task_queues[task_id] = Queue(maxsize=100)
-
-        logger.info(f"创建任务: {task_id}, 文件: {filename}")
-        return self.tasks[task_id]
-
-    def update_progress(self, task_id: str, status: str, progress: int,
-                      message: str, current_step: str = "", details: dict = None):
-        """更新任务进度"""
-        if task_id not in self.task_queues:
-            logger.warning(f"任务不存在: {task_id}")
-            return
-
-        try:
-            update = ProgressUpdate(
-                task_id=task_id,
-                status=status,
-                progress=progress,
-                message=message,
-                current_step=current_step,
-                details=details
-            )
-
-            # 发送更新到队列
-            self.task_queues[task_id].put_nowait(asdict(update))
-
-            # 更新任务信息
-            if task_id in self.tasks:
-                self.tasks[task_id]['updated_at'] = time.time()
-                self.tasks[task_id]['status'] = status
-
-            logger.info(f"进度更新 [{task_id}]: {progress}% - {message}")
-
-        except Exception as e:
-            logger.error(f"更新进度失败 [{task_id}]: {e}")
-
-    def complete_task(self, task_id: str, result: dict = None):
-        """完成任务"""
-        self.update_progress(
-            task_id=task_id,
-            status='completed',
-            progress=100,
-            message='处理完成',
-            details=result
-        )
-
-    def error_task(self, task_id: str, error_message: str):
-        """任务出错"""
-        self.update_progress(
-            task_id=task_id,
-            status='error',
-            progress=0,
-            message=f'处理失败: {error_message}'
-        )
-
-    def get_task_queue(self, task_id: str) -> Optional[Queue]:
-        """获取任务的消息队列"""
-        return self.task_queues.get(task_id)
-
-    def cleanup_old_tasks(self):
-        """清理过期任务（超过5分钟）"""
-        current_time = time.time()
-        expired_tasks = []
-
-        for task_id, task in self.tasks.items():
-            if current_time - task.get('updated_at', 0) > self.cleanup_interval:
-                expired_tasks.append(task_id)
-
-        for task_id in expired_tasks:
-            if task_id in self.task_queues:
-                del self.task_queues[task_id]
-            if task_id in self.tasks:
-                del self.tasks[task_id]
-            logger.info(f"清理过期任务: {task_id}")
-
-# 全局进度管理器实例
-progress_manager = ProgressManager()
-
-
-# API端点
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """健康检查接口"""
@@ -262,36 +153,489 @@ def progress_stream(task_id: str):
         }
     )
 
-@app.route('/api/banks/<int:user_id>', methods=['GET'])
-def get_banks(user_id):
-    """获取用户的所有题库"""
+@app.route('/api/upload', methods=['POST'])
+def upload_document():
+    """上传文档并生成题库"""
     try:
+        # 检查文件
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file selected'
+            }), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'No file selected'
+            }), 400
+
+        # 获取参数
+        user_id = request.form.get('user_id', type=int)
+        bank_name = request.form.get('bank_name', '未命名题库')
+        description = request.form.get('description', '')
+        api_key = request.form.get('api_key', '')
+        chunk_size = request.form.get('chunk_size', 500, type=int)
+        questions_per_chunk = request.form.get('questions_per_chunk', 2, type=int)
+
+        # 生成任务ID
+        task_id = str(uuid.uuid4())
+
+        # 创建任务
+        progress_manager.create_task(task_id, file.filename, user_id)
+
+        # 保存文件（获取原始文件名）
+        filename = secure_filename(file.filename)
+        logger.info(f"原始文件名: {file.filename}, 安全文件名: {filename}")
+
+        # 如果文件名被过滤掉了扩展名，保留原始扩展名
+        if '.' in file.filename and '.' not in filename:
+            # 获取原始文件的扩展名
+            ext = os.path.splitext(file.filename)[1]
+            filename = filename + ext
+            logger.info(f"添加扩展名后: {filename}")
+
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(file_path)
+        logger.info(f"文件上传成功: {filename}, 用户ID: {user_id}")
+        logger.info(f"文件路径: {file_path}")
+
+        # 异步处理文档
+        def process_document_async():
+            try:
+                # 更新进度：开始解析
+                progress_manager.update_progress(
+                    task_id=task_id,
+                    status='processing',
+                    progress=5,
+                    message='开始解析文档...',
+                    current_step='parsing'
+                )
+
+                # 首先解析文档获取文本内容
+                text_content = ""
+                if ParserFactory:
+                    parser = ParserFactory.get_parser(file_path)
+                    text_content = parser.extract_text(file_path)
+                    logger.info(f"文档解析完成，提取文本: {len(text_content)} 字符")
+
+                # 更新进度：解析完成
+                progress_manager.update_progress(
+                    task_id=task_id,
+                    status='processing',
+                    progress=15,
+                    message=f'解析完成，文档长度: {len(text_content)} 字符',
+                    current_step='parsing_complete'
+                )
+
+                # 处理文档和AI生成
+                conn = get_db_connection()
+                if not conn:
+                    progress_manager.error_task(task_id, "数据库连接失败")
+                    return
+
+                # 创建题库记录
+                cur = conn.cursor()
+
+                # 检查是否已存在
+                file_hash = hashlib.md5(text_content.encode()).hexdigest()
+                cur.execute(
+                    f"SELECT bank_id FROM user_custom_banks WHERE user_id = {user_id} AND file_hash = '{file_hash}'"
+                )
+                existing = cur.fetchone()
+
+                if existing:
+                    # 返回已存在的题库
+                    progress_manager.complete_task(task_id, {
+                        'bank_id': existing[0],
+                        'message': '该文档已经处理过',
+                        'already_exists': True
+                    })
+                    conn.close()
+                    os.remove(file_path)  # 清理文件
+                    return
+
+                # 插入新题库
+                cur.execute(f"""
+                    INSERT INTO user_custom_banks
+                    (user_id, bank_name, source_file, description, file_hash, processing_status, question_count)
+                    VALUES ({user_id}, '{bank_name}', '{filename}', '{description}', '{file_hash}', 'processing', 0)
+                    RETURNING bank_id
+                """)
+                bank_id = cur.fetchone()[0]
+
+                all_questions = []
+
+                # 更新进度：开始生成题目
+                progress_manager.update_progress(
+                    task_id=task_id,
+                    status='processing',
+                    progress=25,
+                    message='开始生成题目...',
+                    current_step='generating',
+                    details={'bank_id': bank_id}
+                )
+
+                # 处理文档
+                if ParserFactory and TextProcessor and QuestionGenerator and api_key and api_key != 'test_key' and text_content:
+                    # 处理文本 - 使用智能分块，每块500字，保留100字上下文
+                    text_processor = TextProcessor(chunk_size=500, chunk_overlap=100)
+                    text_content = text_processor.clean_text(text_content)
+                    text_chunks = text_processor.smart_chunk_with_context(text_content)
+
+                    if text_chunks:
+                        question_generator = QuestionGenerator(api_key=api_key)
+
+                        for i, chunk in enumerate(text_chunks):
+                            # 更新进度：处理文本块
+                            progress = 30 + (60 * i // len(text_chunks))
+                            progress_manager.update_progress(
+                                task_id=task_id,
+                                status='processing',
+                                progress=progress,
+                                message=f'处理第 {i+1}/{len(text_chunks)} 个文本块...',
+                                current_step='processing_chunk',
+                                details={'chunk_index': i+1, 'total_chunks': len(text_chunks)}
+                            )
+
+                            questions = question_generator.generate_questions(
+                                chunk_text=chunk.content,
+                                chunk_index=i,
+                                num_questions=min(3, max(1, questions_per_chunk))
+                            )
+
+                            # 保存题目
+                            for q in questions:
+                                original_text = chunk.content[:500] + "..." if len(chunk.content) > 500 else chunk.content
+                                answer_text = f"【AI答案】\n{q.answer}\n\n【原文参考】\n{original_text}"
+
+                                cur.execute(
+                                    """
+                                    INSERT INTO user_custom_questions
+                                    (bank_id, question_text, answer_text, question_type)
+                                    VALUES (%s, %s, %s, %s)
+                                    """,
+                                    (bank_id, q.question, answer_text, 'Q&A')
+                                )
+
+                                all_questions.append(q)
+
+                # 完成任务
+                progress_manager.complete_task(task_id, {
+                    'bank_id': bank_id,
+                    'question_count': len(all_questions),
+                    'message': f'处理完成，共生成 {len(all_questions)} 道题目'
+                })
+
+                conn.close()
+                os.remove(file_path)  # 清理文件
+
+            except Exception as e:
+                logger.error(f"处理文档失败: {e}")
+                progress_manager.error_task(task_id, str(e))
+                if 'conn' in locals():
+                    conn.close()
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+        # 启动异步处理线程
+        thread = threading.Thread(target=process_document_async)
+        thread.daemon = True
+        thread.start()
+
+        # 返回任务ID
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'message': '文件已上传，正在处理中...',
+            'progress_url': f'/api/progress/{task_id}'
+        })
+
+    except Exception as e:
+        logger.error(f"上传失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+        logger.info(f"文件上传成功: {filename}, 用户ID: {user_id}")
+        logger.info(f"文件路径: {file_path}")
+
+        # 检查文件类型（使用保存后的文件路径）
+        if ParserFactory and not ParserFactory.is_supported(filename):
+            os.remove(file_path)  # 删除不支持的文件
+            return jsonify({
+                'success': False,
+                'error': f'不支持的文件类型。支持的类型: {list(ParserFactory.SUPPORTED_EXTENSIONS.keys())}'
+            }), 400
+
+        # 获取数据库连接
         conn = get_db_connection()
         if not conn:
-            return jsonify({'success': False, 'error': 'Database connection failed'}), 500
+            os.remove(file_path)
+            return jsonify({
+                'success': False,
+                'error': 'Database connection failed'
+            }), 500
 
+        # 计算文件哈希
+        file_hash = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                file_hash.update(chunk)
+        file_hash = file_hash.hexdigest()
+
+        # 检查是否已存在
         cur = conn.cursor()
-        cur.execute(f"SELECT * FROM user_custom_banks WHERE user_id = {user_id} ORDER BY created_at DESC")
-        banks = cur.fetchall()
-        conn.close()
+        cur.execute(
+            f"SELECT bank_id FROM user_custom_banks WHERE user_id = {user_id} AND file_hash = {sql_escape(file_hash)}"
+        )
+        existing = cur.fetchone() if cur else None
 
-        bank_list = []
-        for bank in banks:
-            bank_list.append({
-                'bank_id': bank[0],
-                'user_id': bank[1],
-                'bank_name': bank[2],
-                'source_file': bank[3],
-                'description': bank[4],
-                'question_count': bank[5],
-                'created_at': bank[6].isoformat() if bank[6] else None,
-                'file_hash': bank[7],
-                'processing_status': bank[8]
+        if existing:
+            # 返回已存在的题库
+            cur.execute(
+                f"SELECT COUNT(*) FROM user_custom_questions WHERE bank_id = {existing[0]}"
+            )
+            count = cur.fetchone()[0] if cur else 0
+
+            os.remove(file_path)  # 清理文件
+
+            return jsonify({
+                'success': True,
+                'status': 'skipped',
+                'bank_id': existing[0],
+                'question_count': count,
+                'message': '该文档已经处理过'
             })
 
-        return jsonify({'success': True, 'banks': bank_list})
+        # 创建题库记录
+        cur.execute(f"""
+            INSERT INTO user_custom_banks
+            (user_id, bank_name, source_file, description, file_hash, processing_status, question_count)
+            VALUES ({user_id}, {sql_escape(bank_name)}, {sql_escape(filename)}, {sql_escape(description)}, {sql_escape(file_hash)}, 'processing', 0)
+            RETURNING bank_id
+        """)
+
+        # 获取刚插入的ID
+        bank_id = cur.fetchone()[0] if cur else 1
+
+        all_questions = []
+
+        # 处理文档
+        # 首先解析文档获取文本内容
+        text_content = ""
+        if ParserFactory:
+            try:
+                parser = ParserFactory.get_parser(file_path)
+                text_content = parser.extract_text(file_path)
+                logger.info(f"文档解析完成，提取文本: {len(text_content)} 字符")
+            except Exception as e:
+                logger.error(f"文档解析失败: {e}")
+
+        if ParserFactory and TextProcessor and QuestionGenerator and api_key and api_key != 'test_key' and text_content:
+            logger.info("开始处理文档...")
+
+            if text_content and len(text_content.strip()) > 100:
+                # 处理文本 - 使用智能分块，每块500字，保留100字上下文
+                text_processor = TextProcessor(chunk_size=500, chunk_overlap=100)
+                text_content = text_processor.clean_text(text_content)
+                text_chunks = text_processor.smart_chunk_with_context(text_content)
+
+                if text_chunks:
+                    # 生成题目
+                    question_generator = QuestionGenerator(api_key=api_key)
+
+                    for i, chunk in enumerate(text_chunks):
+                        try:
+                            logger.info(f"处理第 {i+1}/{len(text_chunks)} 个文本块...")
+
+                            # 每个文本块生成1-3个问题
+                            num_questions = min(3, max(1, questions_per_chunk))
+                            questions = question_generator.generate_questions(
+                                chunk_text=chunk.content,
+                                chunk_index=i,
+                                num_questions=num_questions
+                            )
+
+                            # 保存题目（使用AI生成的答案）
+                            for q in questions:
+                                # 准备答案文本（AI生成的答案 + 原文参考）
+                                # 限制原文长度，避免过长
+                                original_text = chunk.content[:500] + "..." if len(chunk.content) > 500 else chunk.content
+                                answer_text = f"【AI答案】\n{q.answer}\n\n【原文参考】\n{original_text}"
+
+                                # 保存到数据库
+                                sql = """
+                                    INSERT INTO user_custom_questions
+                                    (bank_id, question_text, answer_text, question_type)
+                                    VALUES (%s, %s, %s, %s)
+                                """
+                                logger.info(f"执行SQL插入题目: {q.question[:50]}...")
+
+                                # 使用参数化查询
+                                cur.execute(sql, (bank_id, q.question, answer_text, 'Q&A'))
+
+                                all_questions.append(q)
+
+                            logger.info(f"第 {i+1} 个文本块处理完成，生成 {len(questions)} 道题目")
+
+                        except Exception as e:
+                            logger.error(f"处理文本块失败: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            continue
+
+                    # 所有题目处理完成
+                    if len(all_questions) > 0:
+                        logger.info(f"成功生成 {len(all_questions)} 道题目")
+
+                        # 更新题库状态
+                        cur.execute(
+                            f"UPDATE user_custom_banks SET processing_status = 'completed', question_count = {len(all_questions)} WHERE bank_id = {bank_id}"
+                        )
+            else:
+                logger.warning("文档内容太少")
+                cur.execute(
+                    f"UPDATE user_custom_banks SET processing_status = 'failed', processing_error = {sql_escape('文档内容太少')} WHERE bank_id = {bank_id}"
+                )
+        else:
+            # 如果没有完整功能，创建示例题目
+            logger.warning("使用示例题目模式（缺少处理模块或API密钥）")
+
+            # 从文档内容创建示例问题
+            if text_content and len(text_content.strip()) > 100:
+                # 取前几个句子创建示例问题
+                sentences = text_content.split('。')[:3]
+                for i, sentence in enumerate(sentences, 1):
+                    if len(sentence.strip()) > 20:
+                        q_text = f"根据以上内容，请解释：{sentence.strip()[:50]}..."
+                        answer_content = "【原文】\n" + sentence.strip() + "\n\n【学习提示】\n1. 请仔细阅读原文，理解其含义\n2. 思考这个句子在文档中的作用\n3. 尝试用自己的话来解释"
+
+                        cur.execute(
+                            """
+                            INSERT INTO user_custom_questions
+                            (bank_id, question_text, answer_text, question_type)
+                            VALUES (%s, %s, %s, %s)
+                            """,
+                            (bank_id, q_text, answer_content, 'Q&A')
+                        )
+                        all_questions.append({'question': q_text})
+            else:
+                # 默认示例问题
+                sample_questions = [
+                    ("请概括文档的主要内容", "请仔细阅读文档，找出核心观点和关键信息。"),
+                    ("文档中提到了哪些重要概念？", "回到原文，找出定义和解释性的句子。"),
+                    ("你如何理解文档中的核心观点？", "阅读原文，形成自己的理解和总结。")
+                ]
+
+                for q_text, hint in sample_questions:
+                    hint_text = "【学习提示】\n" + hint
+                    cur.execute(
+                        """
+                        INSERT INTO user_custom_questions
+                        (bank_id, question_text, answer_text, question_type)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (bank_id, q_text, hint_text, 'Q&A')
+                    )
+                    all_questions.append({'question': q_text})
+
+            cur.execute(
+                f"UPDATE user_custom_banks SET processing_status = 'completed', question_count = {len(all_questions)} WHERE bank_id = {bank_id}"
+            )
+
+        # 清理文件
+        try:
+            os.remove(file_path)
+        except:
+            pass
+
+        logger.info(f"文档处理完成，共生成 {len(all_questions)} 道题目")
+
+        return jsonify({
+            'success': True,
+            'status': 'completed',
+            'bank_id': bank_id,
+            'question_count': len(all_questions),
+            'bank_name': bank_name,
+            'message': f'题库 "{bank_name}" 已成功创建，共 {len(all_questions)} 道题目'
+        })
+
+    except Exception as e:
+        logger.error(f"处理文档失败: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/banks/<int:user_id>', methods=['GET'])
+def get_user_banks(user_id):
+    """获取用户的题库列表"""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'success': False, 'error': 'Database connection failed'}), 500
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT * FROM user_custom_banks WHERE user_id = {user_id} ORDER BY created_at DESC"
+        )
+        banks = []
+
+        rows = cur.fetchall()
+        for row in rows:
+                banks.append({
+                    'bank_id': row[0],
+                    'user_id': row[1],
+                    'bank_name': row[2],
+                    'source_file': row[3],
+                    'description': row[4],
+                    'question_count': row[5],
+                    'created_at': row[6].isoformat() if row[6] else None,
+                    'processing_status': row[10] if len(row) > 10 else 'completed'
+                })
+
+        return jsonify({'success': True, 'banks': banks})
     except Exception as e:
         logger.error(f"获取题库列表失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/banks/<int:bank_id>/questions', methods=['GET'])
+def get_bank_questions(bank_id):
+    """获取题库的题目（不含答案）"""
+    user_id = request.args.get('user_id', type=int)
+    limit = request.args.get('limit', 20, type=int)
+
+    if not user_id:
+        return jsonify({'success': False, 'error': 'user_id is required'}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'success': False, 'error': 'Database connection failed'}), 500
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT question_id, question_text, question_type FROM user_custom_questions WHERE bank_id = {bank_id} LIMIT {limit}"
+        )
+        questions = []
+
+        rows = cur.fetchall()
+        for row in rows:
+                questions.append({
+                    'question_id': row[0],
+                    'question_text': row[1],
+                    'question_type': row[2],
+                    'bank_id': bank_id
+                })
+
+        return jsonify({'success': True, 'questions': questions})
+    except Exception as e:
+        logger.error(f"获取题目失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/banks/<int:bank_id>/info', methods=['GET'])
@@ -372,287 +716,6 @@ def get_unmastered_questions(bank_id):
         logger.error(f"获取未掌握题目失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/upload', methods=['POST'])
-def upload_document():
-    """上传文档并生成题库"""
-    try:
-        # 检查文件
-        if 'file' not in request.files:
-            return jsonify({
-                'success': False,
-                'error': 'No file selected'
-            }), 400
-
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({
-                'success': False,
-                'error': 'No file selected'
-            }), 400
-
-        # 获取参数
-        user_id = request.form.get('user_id', type=int)
-        bank_name = request.form.get('bank_name', '未命名题库')
-        description = request.form.get('description', '')
-        api_key = request.form.get('api_key', '')
-        chunk_size = request.form.get('chunk_size', 500, type=int)
-        questions_per_chunk = request.form.get('questions_per_chunk', 2, type=int)
-
-        if not user_id:
-            return jsonify({
-                'success': False,
-                'error': 'user_id is required'
-            }), 400
-
-        # 生成任务ID
-        task_id = str(uuid.uuid4())
-
-        # 创建任务
-        progress_manager.create_task(task_id, file.filename, user_id)
-
-        # 保存文件
-        filename = secure_filename(file.filename)
-        logger.info(f"原始文件名: {file.filename}, 安全文件名: {filename}")
-
-        # 如果文件名被过滤掉了扩展名，保留原始扩展名
-        if '.' in file.filename and '.' not in filename:
-            ext = os.path.splitext(file.filename)[1]
-            filename = filename + ext
-            logger.info(f"添加扩展名后: {filename}")
-
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(file_path)
-        logger.info(f"文件上传成功: {filename}, 用户ID: {user_id}")
-
-        # 异步处理文档
-        def process_document_async():
-            try:
-                # 更新进度：开始解析
-                progress_manager.update_progress(
-                    task_id=task_id,
-                    status='processing',
-                    progress=5,
-                    message='开始解析文档...',
-                    current_step='parsing'
-                )
-
-                # 解析文档
-                text_content = ""
-                if ParserFactory:
-                    parser = ParserFactory.get_parser(file_path)
-
-                    # 如果是PDF，先获取页数
-                    if file_path.lower().endswith('.pdf'):
-                        try:
-                            import fitz
-                            with fitz.open(file_path) as doc:
-                                page_count = len(doc)
-                                progress_manager.update_progress(
-                                    task_id=task_id,
-                                    status='processing',
-                                    progress=7,
-                                    message=f'开始解析PDF文档，共 {page_count} 页...',
-                                    current_step='parsing_pdf',
-                                    details={'page_count': page_count}
-                                )
-                        except:
-                            pass
-
-                    text_content = parser.extract_text(file_path)
-                    logger.info(f"文档解析完成，提取文本: {len(text_content)} 字符")
-
-                # 更新进度：解析完成
-                progress_manager.update_progress(
-                    task_id=task_id,
-                    status='processing',
-                    progress=15,
-                    message=f'解析完成，文档长度: {len(text_content)} 字符',
-                    current_step='parsing_complete'
-                )
-
-                # 数据库连接
-                conn = get_db_connection()
-                if not conn:
-                    progress_manager.error_task(task_id, "数据库连接失败")
-                    return
-
-                cur = conn.cursor()
-
-                # 检查是否已存在
-                file_hash = hashlib.md5(text_content.encode()).hexdigest()
-                cur.execute(
-                    f"SELECT bank_id FROM user_custom_banks WHERE user_id = {user_id} AND file_hash = '{file_hash}'"
-                )
-                existing = cur.fetchone()
-
-                if existing:
-                    # 返回已存在的题库
-                    progress_manager.complete_task(task_id, {
-                        'bank_id': existing[0],
-                        'message': '该文档已经处理过',
-                        'already_exists': True
-                    })
-                    conn.close()
-                    os.remove(file_path)
-                    return
-
-                # 插入新题库
-                cur.execute(f"""
-                    INSERT INTO user_custom_banks
-                    (user_id, bank_name, source_file, description, file_hash, processing_status, question_count)
-                    VALUES ({user_id}, '{bank_name}', '{filename}', '{description}', '{file_hash}', 'processing', 0)
-                    RETURNING bank_id
-                """)
-                bank_id = cur.fetchone()[0]
-
-                # 更新进度：开始生成题目
-                progress_manager.update_progress(
-                    task_id=task_id,
-                    status='processing',
-                    progress=25,
-                    message='开始生成题目...',
-                    current_step='generating',
-                    details={'bank_id': bank_id}
-                )
-
-                # 处理文档
-                if ParserFactory and TextProcessor and QuestionGenerator and api_key and api_key != 'test_key' and text_content:
-                    # 处理文本 - 使用智能分块，每块500字，保留100字上下文
-                    progress_manager.update_progress(
-                        task_id=task_id,
-                        status='processing',
-                        progress=26,
-                        message='正在清洗和分块文本...',
-                        current_step='text_processing'
-                    )
-
-                    text_processor = TextProcessor(chunk_size=500, chunk_overlap=100)
-                    original_length = len(text_content)
-                    text_content = text_processor.clean_text(text_content)
-                    cleaned_length = len(text_content)
-
-                    progress_manager.update_progress(
-                        task_id=task_id,
-                        status='processing',
-                        progress=27,
-                        message=f'文本清洗完成: {original_length} -> {cleaned_length} 字符',
-                        current_step='text_cleaned',
-                        details={'original_length': original_length, 'cleaned_length': cleaned_length}
-                    )
-
-                    text_chunks = text_processor.smart_chunk_with_context(text_content)
-                    chunk_count = len(text_chunks)
-
-                    progress_manager.update_progress(
-                        task_id=task_id,
-                        status='processing',
-                        progress=28,
-                        message=f'智能分块完成：{cleaned_length} 字符 -> {chunk_count} 块',
-                        current_step='text_chunked',
-                        details={'chunk_count': chunk_count}
-                    )
-
-                    if text_chunks:
-                        question_generator = QuestionGenerator(api_key=api_key)
-                        all_questions = []
-
-                        for i, chunk in enumerate(text_chunks):
-                            # 更新进度
-                            progress = 30 + (65 * i // len(text_chunks))
-                            progress_manager.update_progress(
-                                task_id=task_id,
-                                status='processing',
-                                progress=progress,
-                                message=f'处理第 {i+1}/{len(text_chunks)} 个文本块...',
-                                current_step='processing_chunk',
-                                details={'chunk_index': i+1, 'total_chunks': len(text_chunks)}
-                            )
-
-                            # 生成题目
-                            # 注意：generate_questions内部会打印日志
-                            questions = question_generator.generate_questions(
-                                chunk_text=chunk.content,
-                                chunk_index=i,
-                                num_questions=min(3, max(1, questions_per_chunk))
-                            )
-
-                            # 生成完成后更新进度
-                            if questions:
-                                progress_manager.update_progress(
-                                    task_id=task_id,
-                                    status='processing',
-                                    progress=progress,
-                                    message=f'成功生成 {len(questions)} 道题目',
-                                    current_step='generated_questions',
-                                    details={'questions_generated': len(questions), 'chunk_index': i+1}
-                                )
-
-                            # 保存题目
-                            for q in questions:
-                                original_text = chunk.content[:500] + "..." if len(chunk.content) > 500 else chunk.content
-                                answer_text = f"【AI答案】\n{q.answer}\n\n【原文参考】\n{original_text}"
-
-                                cur.execute(
-                                    """
-                                    INSERT INTO user_custom_questions
-                                    (bank_id, question_text, answer_text, question_type)
-                                    VALUES (%s, %s, %s, %s)
-                                    """,
-                                    (bank_id, q.question, answer_text, 'Q&A')
-                                )
-
-                                all_questions.append(q)
-
-                        # 更新题库状态
-                        cur.execute(
-                            f"UPDATE user_custom_banks SET processing_status = 'completed', question_count = {len(all_questions)} WHERE bank_id = {bank_id}"
-                        )
-
-                    conn.close()
-
-                    # 完成
-                    progress_manager.complete_task(task_id, {
-                        'bank_id': bank_id,
-                        'question_count': len(all_questions),
-                        'message': f'处理完成，共生成 {len(all_questions)} 道题目'
-                    })
-                else:
-                    # 示例题目模式
-                    progress_manager.complete_task(task_id, {
-                        'message': '文档已接收，但需要API密钥来生成题目'
-                    })
-
-                # 清理文件
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-
-            except Exception as e:
-                logger.error(f"处理文档失败: {e}")
-                progress_manager.error_task(task_id, str(e))
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-
-        # 启动异步处理
-        thread = threading.Thread(target=process_document_async)
-        thread.daemon = True
-        thread.start()
-
-        # 返回任务ID
-        return jsonify({
-            'success': True,
-            'task_id': task_id,
-            'message': '文件已上传，正在处理中...',
-            'progress_url': f'/api/progress/{task_id}'
-        })
-
-    except Exception as e:
-        logger.error(f"上传失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-# 其他端点（保持原样）
 @app.route('/api/banks/<int:bank_id>/questions_with_answers', methods=['GET'])
 def get_bank_questions_with_answers(bank_id):
     """获取题库的题目（含答案）"""
@@ -667,34 +730,30 @@ def get_bank_questions_with_answers(bank_id):
 
     try:
         cur = conn.cursor()
-        cur.execute(f"""
-            SELECT q.question_id, q.question_text, q.answer_text, q.question_type
-            FROM user_custom_questions q
-            WHERE q.bank_id = {bank_id}
-            ORDER BY q.question_id
-        """)
+        cur.execute(f"SELECT * FROM user_custom_questions WHERE bank_id = {bank_id}")
         questions = []
 
         rows = cur.fetchall()
         for row in rows:
-            questions.append({
-                'question_id': row[0],
-                'question_text': row[1],
-                'answer_text': row[2],
-                'question_type': row[3],
-                'bank_id': bank_id
-            })
+                questions.append({
+                    'question_id': row[0],
+                    'question_text': row[2],
+                    'answer_text': row[3],
+                    'question_type': row[4],
+                    'difficulty': 1,  # 默认难度
+                    'bank_id': bank_id
+                })
 
         return jsonify({'success': True, 'questions': questions})
     except Exception as e:
-        logger.error(f"获取题目失败: {e}")
+        logger.error(f"获取题目（含答案）失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/banks/<int:bank_id>/questions', methods=['GET'])
-def get_bank_questions(bank_id):
-    """获取题库的题目（不含答案）"""
-    user_id = request.args.get('user_id', type=int)
-    limit = request.args.get('limit', 20, type=int)
+@app.route('/api/banks/<int:bank_id>', methods=['DELETE'])
+def delete_bank(bank_id):
+    """删除题库"""
+    data = request.get_json()
+    user_id = data.get('user_id')
 
     if not user_id:
         return jsonify({'success': False, 'error': 'user_id is required'}), 400
@@ -704,48 +763,8 @@ def get_bank_questions(bank_id):
         return jsonify({'success': False, 'error': 'Database connection failed'}), 500
 
     try:
-        cur = conn.cursor()
-        cur.execute(f"""
-            SELECT question_id, question_text, question_type
-            FROM user_custom_questions
-            WHERE bank_id = {bank_id}
-            ORDER BY question_id
-            LIMIT {limit}
-        """)
-        questions = []
-
-        rows = cur.fetchall()
-        for row in rows:
-            questions.append({
-                'question_id': row[0],
-                'question_text': row[1],
-                'question_type': row[2],
-                'bank_id': bank_id
-            })
-
-        return jsonify({'success': True, 'questions': questions})
-    except Exception as e:
-        logger.error(f"获取题目失败: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/banks/<int:bank_id>', methods=['DELETE'])
-def delete_bank(bank_id):
-    """删除题库"""
-    user_id = request.args.get('user_id', type=int)
-
-    if not user_id:
-        return jsonify({
-            'success': False,
-            'error': 'user_id is required'
-        }), 400
-
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({'success': False, 'error': 'Database connection failed'}), 500
-
-    try:
-        cur = conn.cursor()
         # 删除相关题目和题库
+        cur = conn.cursor()
         cur.execute(f"DELETE FROM user_custom_questions WHERE bank_id = {bank_id}")
         cur.execute(f"DELETE FROM user_custom_banks WHERE bank_id = {bank_id} AND user_id = {user_id}")
 
@@ -776,11 +795,12 @@ def save_answer():
 
         # 获取答题历史以判断是否掌握
         cur.execute(
-            f"""
+            """
             SELECT is_correct, review_count
             FROM user_custom_answers
-            WHERE user_id = {user_id} AND question_id = {question_id}
-            """
+            WHERE user_id = %s AND question_id = %s
+            """,
+            (user_id, question_id)
         )
         existing = cur.fetchone()
 
@@ -827,44 +847,42 @@ def save_answer():
 
 @app.route('/api/stats/<int:user_id>', methods=['GET'])
 def get_user_stats(user_id):
-    """获取用户统计信息"""
+    """获取用户答题统计"""
     conn = get_db_connection()
     if not conn:
         return jsonify({'success': False, 'error': 'Database connection failed'}), 500
 
     try:
         cur = conn.cursor()
-
         # 获取题库数
         cur.execute(f"SELECT COUNT(*) FROM user_custom_banks WHERE user_id = {user_id}")
-        total_banks = cur.fetchone()[0]
+        total_banks = cur.fetchone()[0] if cur else 0
 
         # 获取总题目数
         cur.execute(f"""
             SELECT COUNT(*) FROM user_custom_questions
             WHERE bank_id IN (SELECT bank_id FROM user_custom_banks WHERE user_id = {user_id})
         """)
-        total_questions = cur.fetchone()[0]
+        total_questions = cur.fetchone()[0] if cur else 0
 
         # 获取答题记录
         cur.execute(f"""
             SELECT COUNT(*), SUM(CASE WHEN is_correct THEN 1 ELSE 0 END)
-            FROM user_custom_answers
-            WHERE user_id = {user_id}
+            FROM user_custom_answers WHERE user_id = {user_id}
         """)
         row = cur.fetchone() if cur else (0, 0)
         total_answers, correct_answers = row if row else (0, 0)
 
         accuracy = 0
         if total_answers and total_answers > 0:
-            accuracy = round((correct_answers / total_answers) * 100, 2)
+            accuracy = (correct_answers / total_answers) * 100
 
         stats = {
             'total_banks': total_banks,
             'total_questions': total_questions,
             'total_answers': total_answers,
             'correct_answers': correct_answers,
-            'accuracy': f"{accuracy}%",
+            'accuracy': round(accuracy, 2)
         }
 
         return jsonify({'success': True, 'stats': stats})
@@ -872,13 +890,24 @@ def get_user_stats(user_id):
         logger.error(f"获取统计失败: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# 启动服务器
+@app.errorhandler(413)
+def too_large(e):
+    """文件过大错误处理"""
+    return jsonify({
+        'success': False,
+        'error': 'File too large. Maximum size is 50MB'
+    }), 413
+
 if __name__ == '__main__':
     print("=" * 60)
     print("VocabSlayer 自定义题库API服务器")
     print("=" * 60)
-    print("支持实时进度推送")
+    print(f"上传目录: {UPLOAD_FOLDER}")
+    print("服务器运行在 http://0.0.0.0:5000")
     print("=" * 60)
+
+    # 创建上传目录
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
     # 测试数据库连接
     if get_db_connection():
@@ -886,8 +915,6 @@ if __name__ == '__main__':
     else:
         print("✗ 数据库连接失败")
 
-    # 创建上传目录
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
     # 启动服务器
+    # 开发模式启用自动重载
     app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=True)

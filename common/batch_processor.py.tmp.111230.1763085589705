@@ -1,0 +1,541 @@
+"""
+批处理管理器模块
+负责协调文档解析、文本处理、题目生成的完整流程
+"""
+import os
+import sys
+import json
+import hashlib
+import logging
+import traceback
+from datetime import datetime
+from typing import List, Dict, Optional, Any, Callable
+from dataclasses import dataclass, asdict
+
+# 添加父目录到路径以导入其他模块
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from document_parser import ParserFactory
+from text_processor import TextProcessor, TextChunk
+from question_generator import QuestionGenerator, GeneratedQuestion
+
+# 设置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProcessingResult:
+    """处理结果数据类"""
+    success: bool                          # 是否成功
+    bank_id: Optional[int]                 # 题库ID
+    bank_name: str                         # 题库名称
+    source_file: str                       # 源文件路径
+    total_chunks: int                      # 文本块总数
+    total_questions: int                   # 生成的题目总数
+    processing_time: float                 # 处理时间（秒）
+    error_message: Optional[str] = None    # 错误信息
+    metadata: dict = None                  # 额外元数据
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+    def to_dict(self) -> dict:
+        """转换为字典"""
+        return asdict(self)
+
+
+class DocumentProcessor:
+    """文档处理器主类"""
+
+    def __init__(self,
+                 api_key: str,
+                 db_manager: Optional[Any] = None,
+                 chunk_size: int = 1000,
+                 chunk_overlap: int = 200,
+                 questions_per_chunk: int = 3):
+        """
+        初始化文档处理器
+
+        Args:
+            api_key: DeepSeek API密钥
+            db_manager: 数据库管理器实例
+            chunk_size: 文本块大小
+            chunk_overlap: 块重叠大小
+            questions_per_chunk: 每块生成的题目数
+        """
+        self.api_key = api_key
+        self.db_manager = db_manager
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.questions_per_chunk = questions_per_chunk
+
+        # 初始化组件
+        self.text_processor = TextProcessor(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+        self.question_generator = QuestionGenerator(api_key=api_key)
+
+        # 进度回调
+        self.progress_callback: Optional[Callable] = None
+
+    def process_document(self,
+                        file_path: str,
+                        bank_name: str,
+                        user_id: int,
+                        description: str = "",
+                        progress_callback: Optional[Callable] = None) -> ProcessingResult:
+        """
+        处理文档的完整流程
+
+        Args:
+            file_path: 文档路径
+            bank_name: 题库名称
+            user_id: 用户ID
+            description: 题库描述
+            progress_callback: 进度回调函数(progress, message)
+
+        Returns:
+            处理结果
+        """
+        self.progress_callback = progress_callback
+        start_time = datetime.now()
+
+        try:
+            # 验证文件
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"文件不存在: {file_path}")
+
+            file_size = os.path.getsize(file_path)
+            if file_size > 10 * 1024 * 1024:  # 10MB限制
+                raise ValueError(f"文件过大: {file_size / 1024 / 1024:.2f}MB，最大支持10MB")
+
+            # 计算文件哈希（用于去重）
+            file_hash = self._calculate_file_hash(file_path)
+
+            # 1. 解析文档
+            self._update_progress(10, "正在解析文档...")
+            parser = ParserFactory.get_parser(file_path)
+            raw_text = parser.extract_text(file_path)
+
+            if not raw_text or len(raw_text.strip()) < 100:
+                raise ValueError("文档内容过少，无法生成题目")
+
+            logger.info(f"文档解析完成，提取文本长度: {len(raw_text)}")
+
+            # 2. 文本清洗
+            self._update_progress(20, "正在清洗文本...")
+            clean_text = self.text_processor.clean_text(raw_text)
+
+            # 3. 文本分块
+            self._update_progress(30, "正在分割文本...")
+            chunks = self.text_processor.chunk_text(clean_text, method="recursive")
+            total_chunks = len(chunks)
+
+            logger.info(f"文本分块完成，共 {total_chunks} 个块")
+
+            # 4. 创建题库记录（如果有数据库）
+            bank_id = None
+            if self.db_manager:
+                self._update_progress(35, "创建题库记录...")
+                bank_id = self._create_bank_record(
+                    user_id=user_id,
+                    bank_name=bank_name,
+                    source_file=os.path.basename(file_path),
+                    description=description,
+                    file_hash=file_hash,
+                    total_chunks=total_chunks
+                )
+
+            # 5. 批量生成题目
+            self._update_progress(40, "开始生成题目...")
+            all_questions = self._generate_questions_for_chunks(
+                chunks=chunks,
+                bank_id=bank_id,
+                start_progress=40,
+                end_progress=90
+            )
+
+            total_questions = len(all_questions)
+            logger.info(f"题目生成完成，共 {total_questions} 道")
+
+            # 6. 保存题目到数据库
+            if self.db_manager and bank_id:
+                self._update_progress(90, "保存题目到数据库...")
+                self._save_questions_to_db(bank_id, all_questions)
+
+                # 更新题库状态
+                self._update_bank_status(
+                    bank_id=bank_id,
+                    status="completed",
+                    question_count=total_questions
+                )
+
+            # 7. 完成
+            self._update_progress(100, "处理完成！")
+
+            processing_time = (datetime.now() - start_time).total_seconds()
+
+            return ProcessingResult(
+                success=True,
+                bank_id=bank_id,
+                bank_name=bank_name,
+                source_file=file_path,
+                total_chunks=total_chunks,
+                total_questions=total_questions,
+                processing_time=processing_time,
+                metadata={
+                    "file_hash": file_hash,
+                    "file_size": file_size,
+                    "text_length": len(clean_text),
+                    "api_calls": self.question_generator.api_call_count,
+                    "tokens_used": self.question_generator.total_tokens_used
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"文档处理失败: {str(e)}")
+            logger.debug(traceback.format_exc())
+
+            # 更新数据库状态（如果有）
+            if self.db_manager and 'bank_id' in locals() and bank_id:
+                self._update_bank_status(
+                    bank_id=bank_id,
+                    status="failed",
+                    error=str(e)
+                )
+
+            processing_time = (datetime.now() - start_time).total_seconds()
+
+            return ProcessingResult(
+                success=False,
+                bank_id=None,
+                bank_name=bank_name,
+                source_file=file_path,
+                total_chunks=0,
+                total_questions=0,
+                processing_time=processing_time,
+                error_message=str(e)
+            )
+
+    def _generate_questions_for_chunks(self,
+                                      chunks: List[TextChunk],
+                                      bank_id: Optional[int],
+                                      start_progress: int = 40,
+                                      end_progress: int = 90) -> List[GeneratedQuestion]:
+        """
+        为文本块批量生成题目
+
+        Args:
+            chunks: 文本块列表
+            bank_id: 题库ID
+            start_progress: 起始进度
+            end_progress: 结束进度
+
+        Returns:
+            生成的题目列表
+        """
+        all_questions = []
+        total_chunks = len(chunks)
+
+        for i, chunk in enumerate(chunks):
+            # 计算当前进度
+            progress = start_progress + (end_progress - start_progress) * (i / total_chunks)
+            self._update_progress(progress, f"处理文本块 {i+1}/{total_chunks}...")
+
+            try:
+                # 生成题目
+                questions = self.question_generator.generate_questions(
+                    chunk_text=chunk.content,
+                    chunk_index=i,
+                    num_questions=self.questions_per_chunk
+                )
+
+                # 添加到总列表
+                all_questions.extend(questions)
+
+                logger.info(f"块 {i+1} 生成了 {len(questions)} 道题目")
+
+                # 实时保存到数据库（可选）
+                if self.db_manager and bank_id and questions:
+                    self._save_questions_to_db(bank_id, questions)
+
+            except Exception as e:
+                logger.error(f"块 {i+1} 生成题目失败: {e}")
+                # 继续处理下一个块
+
+        return all_questions
+
+    def _create_bank_record(self,
+                           user_id: int,
+                           bank_name: str,
+                           source_file: str,
+                           description: str,
+                           file_hash: str,
+                           total_chunks: int) -> int:
+        """
+        创建题库记录
+
+        Args:
+            user_id: 用户ID
+            bank_name: 题库名称
+            source_file: 源文件名
+            description: 描述
+            file_hash: 文件哈希
+            total_chunks: 文本块总数
+
+        Returns:
+            题库ID
+        """
+        if not self.db_manager:
+            return None
+
+        try:
+            bank_id = self.db_manager.create_custom_bank(
+                user_id=user_id,
+                bank_name=bank_name,
+                source_file=source_file,
+                description=description,
+                file_hash=file_hash,
+                total_chunks=total_chunks
+            )
+            logger.info(f"创建题库记录成功，ID: {bank_id}")
+            return bank_id
+
+        except Exception as e:
+            logger.error(f"创建题库记录失败: {e}")
+            raise
+
+    def _save_questions_to_db(self, bank_id: int, questions: List[GeneratedQuestion]):
+        """
+        保存题目到数据库
+
+        Args:
+            bank_id: 题库ID
+            questions: 题目列表
+        """
+        if not self.db_manager:
+            return
+
+        saved_count = 0
+        for question in questions:
+            try:
+                question_id = self.db_manager.add_custom_question(
+                    bank_id=bank_id,
+                    question_text=question.question,
+                    answer_text=question.answer,
+                    difficulty=question.difficulty,
+                    source_chunk_index=question.source_chunk_index,
+                    question_type=question.question_type,
+                    confidence_score=question.confidence_score
+                )
+                saved_count += 1
+
+            except Exception as e:
+                logger.error(f"保存题目失败: {e}")
+
+        logger.info(f"保存了 {saved_count}/{len(questions)} 道题目")
+
+    def _update_bank_status(self,
+                           bank_id: int,
+                           status: str,
+                           question_count: int = 0,
+                           error: str = None):
+        """
+        更新题库状态
+
+        Args:
+            bank_id: 题库ID
+            status: 状态
+            question_count: 题目数量
+            error: 错误信息
+        """
+        if not self.db_manager:
+            return
+
+        try:
+            self.db_manager.update_bank_status(
+                bank_id=bank_id,
+                status=status,
+                question_count=question_count,
+                error=error
+            )
+            logger.info(f"题库状态更新为: {status}")
+
+        except Exception as e:
+            logger.error(f"更新题库状态失败: {e}")
+
+    def _calculate_file_hash(self, file_path: str) -> str:
+        """
+        计算文件哈希值
+
+        Args:
+            file_path: 文件路径
+
+        Returns:
+            MD5哈希值
+        """
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+    def _update_progress(self, progress: float, message: str):
+        """
+        更新进度
+
+        Args:
+            progress: 进度百分比(0-100)
+            message: 进度消息
+        """
+        if self.progress_callback:
+            self.progress_callback(progress, message)
+        logger.info(f"[{progress:.0f}%] {message}")
+
+
+class BatchProcessor:
+    """批处理器，支持多文档处理"""
+
+    def __init__(self,
+                 api_key: str,
+                 db_manager: Optional[Any] = None):
+        """
+        初始化批处理器
+
+        Args:
+            api_key: API密钥
+            db_manager: 数据库管理器
+        """
+        self.api_key = api_key
+        self.db_manager = db_manager
+        self.processor = DocumentProcessor(
+            api_key=api_key,
+            db_manager=db_manager
+        )
+
+    def process_multiple_documents(self,
+                                  file_list: List[Dict[str, Any]],
+                                  user_id: int,
+                                  progress_callback: Optional[Callable] = None) -> List[ProcessingResult]:
+        """
+        批量处理多个文档
+
+        Args:
+            file_list: 文件列表，每个元素包含 file_path, bank_name, description
+            user_id: 用户ID
+            progress_callback: 总进度回调
+
+        Returns:
+            处理结果列表
+        """
+        results = []
+        total_files = len(file_list)
+
+        for i, file_info in enumerate(file_list):
+            logger.info(f"处理文件 {i+1}/{total_files}: {file_info['file_path']}")
+
+            # 单文件进度回调
+            def file_progress(p, m):
+                if progress_callback:
+                    overall_progress = (i / total_files + p / 100 / total_files) * 100
+                    progress_callback(overall_progress, f"[{i+1}/{total_files}] {m}")
+
+            # 处理单个文档
+            result = self.processor.process_document(
+                file_path=file_info['file_path'],
+                bank_name=file_info.get('bank_name', f"题库_{i+1}"),
+                user_id=user_id,
+                description=file_info.get('description', ''),
+                progress_callback=file_progress
+            )
+
+            results.append(result)
+
+        # 汇总统计
+        success_count = sum(1 for r in results if r.success)
+        total_questions = sum(r.total_questions for r in results)
+
+        logger.info(f"批处理完成: {success_count}/{total_files} 成功，共生成 {total_questions} 道题目")
+
+        return results
+
+
+# 便捷函数
+def process_document_simple(file_path: str,
+                           api_key: str,
+                           bank_name: str = None) -> ProcessingResult:
+    """
+    简单的文档处理函数（不使用数据库）
+
+    Args:
+        file_path: 文档路径
+        api_key: API密钥
+        bank_name: 题库名称
+
+    Returns:
+        处理结果
+    """
+    if not bank_name:
+        bank_name = os.path.splitext(os.path.basename(file_path))[0]
+
+    processor = DocumentProcessor(api_key=api_key)
+
+    return processor.process_document(
+        file_path=file_path,
+        bank_name=bank_name,
+        user_id=0,  # 无数据库时使用默认用户ID
+        description="自动生成的题库"
+    )
+
+
+if __name__ == "__main__":
+    # 测试代码
+    import argparse
+
+    parser = argparse.ArgumentParser(description="处理文档生成题库")
+    parser.add_argument("file", help="要处理的文档路径")
+    parser.add_argument("--api-key", help="DeepSeek API密钥", default=os.getenv("DEEPSEEK_API_KEY"))
+    parser.add_argument("--bank-name", help="题库名称", default=None)
+    parser.add_argument("--questions-per-chunk", help="每块生成题目数", type=int, default=3)
+
+    args = parser.parse_args()
+
+    if not args.api_key or args.api_key == "your-api-key-here":
+        print("请提供API密钥（通过--api-key参数或DEEPSEEK_API_KEY环境变量）")
+        sys.exit(1)
+
+    # 处理文档
+    print(f"开始处理文档: {args.file}")
+
+    def progress_callback(progress, message):
+        print(f"[{progress:.0f}%] {message}")
+
+    processor = DocumentProcessor(
+        api_key=args.api_key,
+        questions_per_chunk=args.questions_per_chunk
+    )
+
+    result = processor.process_document(
+        file_path=args.file,
+        bank_name=args.bank_name or os.path.basename(args.file),
+        user_id=0,
+        progress_callback=progress_callback
+    )
+
+    # 显示结果
+    print("\n" + "="*50)
+    if result.success:
+        print("✅ 处理成功！")
+        print(f"题库名称: {result.bank_name}")
+        print(f"文本块数: {result.total_chunks}")
+        print(f"题目总数: {result.total_questions}")
+        print(f"处理时间: {result.processing_time:.2f}秒")
+        if result.metadata:
+            print(f"API调用: {result.metadata.get('api_calls', 0)}次")
+            print(f"Token使用: {result.metadata.get('tokens_used', 0)}")
+    else:
+        print("❌ 处理失败！")
+        print(f"错误信息: {result.error_message}")

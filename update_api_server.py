@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 """
+更新api_server.py，添加进度推送功能
+"""
+import shutil
+
+# 备份原文件
+shutil.copy('api_server.py', 'api_server_backup.py')
+print("✓ 已备份 api_server.py 为 api_server_backup.py")
+
+# 读取必要的部分并创建新文件
+with open('api_server_progress.py', 'r') as f:
+    progress_content = f.read()
+
+with open('progress_manager.py', 'r') as f:
+    manager_content = f.read()
+
+# 创建新的 api_server.py
+with open('api_server_new.py', 'w', encoding='utf-8') as f:
+    # 写入导入部分
+    f.write('''#!/usr/bin/env python3
+"""
 VocabSlayer 自定义题库API服务器
 完整功能版本 - 支持文档解析、AI生成题目、实时进度推送
 """
@@ -21,6 +41,9 @@ from queue import Queue, Empty
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 sys.path.insert(0, os.path.join(current_dir, 'common'))
+
+# 导入进度管理器
+from progress_manager import progress_manager
 
 # 配置
 app = Flask(__name__)
@@ -76,132 +99,15 @@ try:
     logger.info("✓ 导入题目生成器")
 except ImportError as e:
     logger.warning(f"✗ 无法导入题目生成器: {e}")
+''')
 
-"""
-进度管理器 - 管理文件处理任务的进度
-"""
-import json
-import time
-from typing import Dict, Optional
-from dataclasses import dataclass, asdict
-from queue import Queue, Empty
-import logging
+    # 写入进度管理器代码
+    f.write('\n')
+    f.write(manager_content)
+    f.write('\n\n')
 
-logger = logging.getLogger(__name__)
-
-@dataclass
-class ProgressUpdate:
-    """进度更新消息"""
-    task_id: str
-    status: str  # 'processing', 'completed', 'error'
-    progress: int  # 0-100
-    message: str
-    current_step: str
-    details: Optional[dict] = None
-    timestamp: float = None
-
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = time.time()
-
-class ProgressManager:
-    """进度管理器"""
-
-    def __init__(self):
-        self.task_queues: Dict[str, Queue] = {}
-        self.tasks: Dict[str, dict] = {}
-        self.cleanup_interval = 300  # 5分钟清理一次过期任务
-
-    def create_task(self, task_id: str, filename: str, user_id: int) -> dict:
-        """创建新任务"""
-        self.tasks[task_id] = {
-            'task_id': task_id,
-            'filename': filename,
-            'user_id': user_id,
-            'created_at': time.time(),
-            'updated_at': time.time()
-        }
-
-        # 创建任务的消息队列
-        if task_id not in self.task_queues:
-            self.task_queues[task_id] = Queue(maxsize=100)
-
-        logger.info(f"创建任务: {task_id}, 文件: {filename}")
-        return self.tasks[task_id]
-
-    def update_progress(self, task_id: str, status: str, progress: int,
-                      message: str, current_step: str = "", details: dict = None):
-        """更新任务进度"""
-        if task_id not in self.task_queues:
-            logger.warning(f"任务不存在: {task_id}")
-            return
-
-        try:
-            update = ProgressUpdate(
-                task_id=task_id,
-                status=status,
-                progress=progress,
-                message=message,
-                current_step=current_step,
-                details=details
-            )
-
-            # 发送更新到队列
-            self.task_queues[task_id].put_nowait(asdict(update))
-
-            # 更新任务信息
-            if task_id in self.tasks:
-                self.tasks[task_id]['updated_at'] = time.time()
-                self.tasks[task_id]['status'] = status
-
-            logger.info(f"进度更新 [{task_id}]: {progress}% - {message}")
-
-        except Exception as e:
-            logger.error(f"更新进度失败 [{task_id}]: {e}")
-
-    def complete_task(self, task_id: str, result: dict = None):
-        """完成任务"""
-        self.update_progress(
-            task_id=task_id,
-            status='completed',
-            progress=100,
-            message='处理完成',
-            details=result
-        )
-
-    def error_task(self, task_id: str, error_message: str):
-        """任务出错"""
-        self.update_progress(
-            task_id=task_id,
-            status='error',
-            progress=0,
-            message=f'处理失败: {error_message}'
-        )
-
-    def get_task_queue(self, task_id: str) -> Optional[Queue]:
-        """获取任务的消息队列"""
-        return self.task_queues.get(task_id)
-
-    def cleanup_old_tasks(self):
-        """清理过期任务（超过5分钟）"""
-        current_time = time.time()
-        expired_tasks = []
-
-        for task_id, task in self.tasks.items():
-            if current_time - task.get('updated_at', 0) > self.cleanup_interval:
-                expired_tasks.append(task_id)
-
-        for task_id in expired_tasks:
-            if task_id in self.task_queues:
-                del self.task_queues[task_id]
-            if task_id in self.tasks:
-                del self.tasks[task_id]
-            logger.info(f"清理过期任务: {task_id}")
-
-# 全局进度管理器实例
-progress_manager = ProgressManager()
-
-
+    # 写入端点
+    f.write('''
 # API端点
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -226,7 +132,7 @@ def progress_stream(task_id: str):
     def generate():
         queue = progress_manager.get_task_queue(task_id)
         if not queue:
-            yield f"data: {json.dumps({'error': 'Task not found'})}\n\n"
+            yield f"data: {json.dumps({'error': 'Task not found'})}\\n\\n"
             return
 
         try:
@@ -236,20 +142,20 @@ def progress_stream(task_id: str):
                     message = queue.get(timeout=1)  # 1秒超时
 
                     # 转换为SSE格式
-                    yield f"data: {json.dumps(message)}\n\n"
+                    yield f"data: {json.dumps(message)}\\n\\n"
 
                     # 如果任务完成或出错，结束流
                     if message.get('status') in ['completed', 'error']:
-                        yield f"event: close\ndata: {json.dumps({'status': message['status']})}\n\n"
+                        yield f"event: close\\ndata: {json.dumps({'status': message['status']})}\\n\\n"
                         break
 
                 except Empty:
                     # 发送心跳
-                    yield f": heartbeat\n\n"
+                    yield f": heartbeat\\n\\n"
 
         except Exception as e:
             logger.error(f"进度流错误: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'error': str(e)})}\\n\\n"
 
     return Response(
         stream_with_context(generate()),
@@ -440,24 +346,6 @@ def upload_document():
                 text_content = ""
                 if ParserFactory:
                     parser = ParserFactory.get_parser(file_path)
-
-                    # 如果是PDF，先获取页数
-                    if file_path.lower().endswith('.pdf'):
-                        try:
-                            import fitz
-                            with fitz.open(file_path) as doc:
-                                page_count = len(doc)
-                                progress_manager.update_progress(
-                                    task_id=task_id,
-                                    status='processing',
-                                    progress=7,
-                                    message=f'开始解析PDF文档，共 {page_count} 页...',
-                                    current_step='parsing_pdf',
-                                    details={'page_count': page_count}
-                                )
-                        except:
-                            pass
-
                     text_content = parser.extract_text(file_path)
                     logger.info(f"文档解析完成，提取文本: {len(text_content)} 字符")
 
@@ -518,39 +406,9 @@ def upload_document():
                 # 处理文档
                 if ParserFactory and TextProcessor and QuestionGenerator and api_key and api_key != 'test_key' and text_content:
                     # 处理文本 - 使用智能分块，每块500字，保留100字上下文
-                    progress_manager.update_progress(
-                        task_id=task_id,
-                        status='processing',
-                        progress=26,
-                        message='正在清洗和分块文本...',
-                        current_step='text_processing'
-                    )
-
                     text_processor = TextProcessor(chunk_size=500, chunk_overlap=100)
-                    original_length = len(text_content)
                     text_content = text_processor.clean_text(text_content)
-                    cleaned_length = len(text_content)
-
-                    progress_manager.update_progress(
-                        task_id=task_id,
-                        status='processing',
-                        progress=27,
-                        message=f'文本清洗完成: {original_length} -> {cleaned_length} 字符',
-                        current_step='text_cleaned',
-                        details={'original_length': original_length, 'cleaned_length': cleaned_length}
-                    )
-
                     text_chunks = text_processor.smart_chunk_with_context(text_content)
-                    chunk_count = len(text_chunks)
-
-                    progress_manager.update_progress(
-                        task_id=task_id,
-                        status='processing',
-                        progress=28,
-                        message=f'智能分块完成：{cleaned_length} 字符 -> {chunk_count} 块',
-                        current_step='text_chunked',
-                        details={'chunk_count': chunk_count}
-                    )
 
                     if text_chunks:
                         question_generator = QuestionGenerator(api_key=api_key)
@@ -569,28 +427,16 @@ def upload_document():
                             )
 
                             # 生成题目
-                            # 注意：generate_questions内部会打印日志
                             questions = question_generator.generate_questions(
                                 chunk_text=chunk.content,
                                 chunk_index=i,
                                 num_questions=min(3, max(1, questions_per_chunk))
                             )
 
-                            # 生成完成后更新进度
-                            if questions:
-                                progress_manager.update_progress(
-                                    task_id=task_id,
-                                    status='processing',
-                                    progress=progress,
-                                    message=f'成功生成 {len(questions)} 道题目',
-                                    current_step='generated_questions',
-                                    details={'questions_generated': len(questions), 'chunk_index': i+1}
-                                )
-
                             # 保存题目
                             for q in questions:
                                 original_text = chunk.content[:500] + "..." if len(chunk.content) > 500 else chunk.content
-                                answer_text = f"【AI答案】\n{q.answer}\n\n【原文参考】\n{original_text}"
+                                answer_text = f"【AI答案】\\n{q.answer}\\n\\n【原文参考】\\n{original_text}"
 
                                 cur.execute(
                                     """
@@ -891,3 +737,9 @@ if __name__ == '__main__':
 
     # 启动服务器
     app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=True)
+''')
+
+print("✓ 已创建 api_server_new.py")
+print("\n请运行以下命令来应用更新：")
+print("1. mv api_server_new.py api_server.py")
+print("2. 重启服务器")
