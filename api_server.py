@@ -220,33 +220,96 @@ def health_check():
         'modules': modules
     })
 
+@app.route('/api/test-sse', methods=['GET'])
+def test_sse():
+    """测试SSE端点"""
+    logger.info("测试SSE端点被调用")
+
+    def generate():
+        import time
+        for i in range(5):
+            data = {
+                'progress': (i + 1) * 20,
+                'message': f'测试消息 {i+1}',
+                'status': 'processing' if i < 4 else 'completed'
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            time.sleep(1)
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
+        }
+    )
+
 @app.route('/api/progress/<task_id>', methods=['GET'])
 def progress_stream(task_id: str):
     """SSE进度流"""
-    def generate():
-        queue = progress_manager.get_task_queue(task_id)
-        if not queue:
-            yield f"data: {json.dumps({'error': 'Task not found'})}\n\n"
-            return
+    logger.info(f"SSE连接请求: task_id={task_id}")
 
+    queue = progress_manager.get_task_queue(task_id)
+    if not queue:
+        logger.warning(f"Task not found: {task_id}")
+        return Response(
+            f"data: {json.dumps({'error': 'Task not found'})}\n\n",
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'Access-Control-Allow-Origin': '*'
+            }
+        )
+
+    logger.info(f"找到任务队列: {task_id}")
+
+    def generate():
         try:
+            logger.info(f"开始SSE流: {task_id}")
+
+            # 发送连接确认消息
+            connection_msg = {
+                'task_id': task_id,
+                'status': 'connected',
+                'progress': 0,
+                'message': '已连接到进度监控',
+                'timestamp': time.time()
+            }
+            yield f"data: {json.dumps(connection_msg)}\n\n"
+            logger.info(f"SSE连接已建立: {task_id}")
+
             while True:
                 try:
                     # 从队列获取消息
-                    message = queue.get(timeout=1)  # 1秒超时
+                    message = queue.get(timeout=0.1)  # 减少超时时间
+                    if not message:
+                        continue
 
-                    # 转换为SSE格式
-                    yield f"data: {json.dumps(message)}\n\n"
+                    # logger.debug(f"SSE发送消息: {task_id} - {message.get('message', '')[:50]}...")  # 改为debug级别，减少日志
+
+                    # 转换为SSE格式并立即发送
+                    data_str = json.dumps(message, ensure_ascii=False)
+                    yield f"data: {data_str}\n\n"
 
                     # 如果任务完成或出错，结束流
                     if message.get('status') in ['completed', 'error']:
-                        yield f"event: close\ndata: {json.dumps({'status': message['status']})}\n\n"
+                        logger.info(f"任务结束: {task_id} - {message.get('status')}")
+                        yield f"event: close\ndata: {json.dumps({'status': message['status']}, ensure_ascii=False)}\n\n"
                         break
 
                 except Empty:
-                    # 发送心跳
-                    yield f": heartbeat\n\n"
+                    # 队列为空时不发送心跳，减少网络流量
+                    # 客户端会保持连接直到收到完成或错误消息
+                    continue
+                except Exception as e:
+                    logger.error(f"SSE生成器错误: {e}")
+                    break
 
+        except GeneratorExit:
+            logger.info(f"SSE客户端断开连接: {task_id}")
         except Exception as e:
             logger.error(f"进度流错误: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -258,7 +321,8 @@ def progress_stream(task_id: str):
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Cache-Control'
+            'Access-Control-Allow-Headers': 'Cache-Control',
+            'X-Accel-Buffering': 'no'  # 禁用nginx缓冲
         }
     )
 
@@ -427,6 +491,10 @@ def upload_document():
         # 异步处理文档
         def process_document_async():
             try:
+                # 给客户端时间连接SSE流
+                import time
+                time.sleep(1.0)
+
                 # 更新进度：开始解析
                 progress_manager.update_progress(
                     task_id=task_id,
@@ -435,6 +503,9 @@ def upload_document():
                     message='开始解析文档...',
                     current_step='parsing'
                 )
+
+                # 添加小延迟，让前端能看到第一步
+                time.sleep(0.5)
 
                 # 解析文档
                 text_content = ""
@@ -455,6 +526,7 @@ def upload_document():
                                     current_step='parsing_pdf',
                                     details={'page_count': page_count}
                                 )
+                                time.sleep(0.5)  # 延迟显示
                         except:
                             pass
 
@@ -469,6 +541,7 @@ def upload_document():
                     message=f'解析完成，文档长度: {len(text_content)} 字符',
                     current_step='parsing_complete'
                 )
+                time.sleep(0.5)  # 延迟显示
 
                 # 数据库连接
                 conn = get_db_connection()
@@ -525,6 +598,7 @@ def upload_document():
                         message='正在清洗和分块文本...',
                         current_step='text_processing'
                     )
+                    time.sleep(0.5)  # 延迟显示
 
                     text_processor = TextProcessor(chunk_size=500, chunk_overlap=100)
                     original_length = len(text_content)
@@ -539,6 +613,7 @@ def upload_document():
                         current_step='text_cleaned',
                         details={'original_length': original_length, 'cleaned_length': cleaned_length}
                     )
+                    time.sleep(0.5)  # 延迟显示
 
                     text_chunks = text_processor.smart_chunk_with_context(text_content)
                     chunk_count = len(text_chunks)
@@ -551,6 +626,7 @@ def upload_document():
                         current_step='text_chunked',
                         details={'chunk_count': chunk_count}
                     )
+                    time.sleep(0.5)  # 延迟显示
 
                     if text_chunks:
                         question_generator = QuestionGenerator(api_key=api_key)
@@ -890,4 +966,4 @@ if __name__ == '__main__':
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
     # 启动服务器
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

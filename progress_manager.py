@@ -47,7 +47,7 @@ class ProgressManager:
         if task_id not in self.task_queues:
             self.task_queues[task_id] = Queue(maxsize=100)
 
-        logger.info(f"创建任务: {task_id}, 文件: {filename}")
+        # logger.debug(f"创建任务: {task_id}, 文件: {filename}")  # 改为debug级别
         return self.tasks[task_id]
 
     def update_progress(self, task_id: str, status: str, progress: int,
@@ -75,7 +75,7 @@ class ProgressManager:
                 self.tasks[task_id]['updated_at'] = time.time()
                 self.tasks[task_id]['status'] = status
 
-            logger.info(f"进度更新 [{task_id}]: {progress}% - {message}")
+            # logger.debug(f"进度更新 [{task_id}]: {progress}% - {message}")  # 改为debug级别
 
         except Exception as e:
             logger.error(f"更新进度失败 [{task_id}]: {e}")
@@ -117,7 +117,7 @@ class ProgressManager:
                 del self.task_queues[task_id]
             if task_id in self.tasks:
                 del self.tasks[task_id]
-            logger.info(f"清理过期任务: {task_id}")
+            # logger.debug(f"清理过期任务: {task_id}")  # 改为debug级别
 
 # 全局进度管理器实例
 progress_manager = ProgressManager()
